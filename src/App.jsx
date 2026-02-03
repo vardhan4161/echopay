@@ -48,13 +48,18 @@ const buildPayload = ({ senderId, amountPaise, timestampSec, nonce }) => {
 }
 
 const validatePacket = async (packet) => {
+  console.log('Decoded packet bytes:', Array.from(packet))
   const { senderId, amountPaise, timestampSec, nonce, signature } = parsePacket(packet)
+  console.log('Decoded amount (paise):', amountPaise)
+  console.log('Decoded timestamp (sec):', timestampSec)
   const payload = packet.slice(0, 14)
   const isValid = await verifySignature(payload, signature)
+  console.log('Signature valid:', isValid)
   if (!isValid) {
     throw new Error('Invalid signature')
   }
   const now = Math.floor(Date.now() / 1000)
+  console.log('Now (sec):', now)
   if (Math.abs(now - timestampSec) > MAX_PACKET_AGE_SEC) {
     throw new Error('Stale timestamp')
   }
@@ -77,6 +82,7 @@ function App() {
   const audioContextRef = useRef(null)
   const decoderRef = useRef(null)
   const bitBufferRef = useRef([])
+  const expectedSenderIdRef = useRef(null)
   const balance = account?.balance ?? 0
   const userId = account?.userId ?? 0
 
@@ -85,9 +91,18 @@ function App() {
     const next = accounts.some((item) => item.userId === updated.userId)
       ? accounts.map((item) => (item.userId === updated.userId ? updated : item))
       : [...accounts, updated]
-    setAccount(updated)
     saveAccounts(next)
     saveCurrentAccountId(updated.userId)
+  }
+
+  const updateAccount = (updater) => {
+    // Use functional state to avoid stale balance during async receive verification.
+    setAccount((prev) => {
+      if (!prev) return prev
+      const next = updater(prev)
+      persistAccount(next)
+      return next
+    })
   }
 
   useEffect(() => {
@@ -147,8 +162,7 @@ function App() {
       setSendStatus('Sending...')
       await playBits(bits, { bitDuration: BIT_DURATION_SEC, gapDuration: 0.004 }, audioContextRef)
       setSendStatus('Sent via sound.')
-      const updated = { ...account, balance: account.balance - amountValue }
-      persistAccount(updated)
+      updateAccount((prev) => ({ ...prev, balance: prev.balance - amountValue }))
     } catch (err) {
       setError(err.message || 'Send failed.')
     }
@@ -172,6 +186,8 @@ function App() {
       setError('Enter sender device ID.')
       return
     }
+    // Lock the expected sender ID at listen start to avoid rejecting valid packets.
+    expectedSenderIdRef.current = expectedId
     try {
       decoderRef.current = await startDecoder({
         bitDuration: BIT_DURATION_SEC,
@@ -192,24 +208,23 @@ function App() {
             stopListening()
             validatePacket(packet)
               .then((data) => {
-                const expectedId = Number.parseInt(counterpartyIdInput, 10)
-                if (!Number.isFinite(expectedId)) {
+                const expectedSenderId = expectedSenderIdRef.current
+                console.log('Expected sender ID:', expectedSenderId)
+                console.log('Packet sender ID:', data.senderId)
+                if (!Number.isFinite(expectedSenderId)) {
                   setError('Enter sender device ID.')
                   return
                 }
-                if (data.senderId !== expectedId) {
+                if (data.senderId !== expectedSenderId) {
                   setError('Sender device ID mismatch.')
                   return
                 }
                 setReceived(data)
                 setError('')
-                if (account) {
-                  const updated = {
-                    ...account,
-                    balance: account.balance + data.amountPaise / 100,
-                  }
-                  persistAccount(updated)
-                }
+                updateAccount((prev) => ({
+                  ...prev,
+                  balance: prev.balance + data.amountPaise / 100,
+                }))
               })
               .catch((err) => setError(err.message || 'Invalid packet'))
             return
@@ -247,6 +262,7 @@ function App() {
       balance: 500,
     }
     // Demo-only account system.
+    setAccount(newAccount)
     persistAccount(newAccount)
   }
 
